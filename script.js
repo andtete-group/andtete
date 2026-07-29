@@ -184,11 +184,28 @@ function productCard(product) {
 
 let allProductsCache = [];
 let activeListCategory = "all";
-let activeGridSize = localStorage.getItem("andteteListGridSize") || "3";
 const productsStorageKey = "andteteProductsPreview";
 const sheetUrlStorageKey = "andteteSheetWebhookUrl";
 const customCategoriesStorageKey = "andteteCustomCategories";
+const productDataCacheKey = "andteteRemoteProductCache";
+let activeGridSize = readLocalSetting("andteteListGridSize", "3");
 let customerCustomCategories = [];
+let remoteProductsRequest = null;
+let slidersInitialized = false;
+
+function readLocalSetting(key, fallback = "") {
+  try {
+    return localStorage.getItem(key) || fallback;
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function writeLocalSetting(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {}
+}
 
 function normalizeCustomerCategories(categories) {
   return Array.isArray(categories)
@@ -215,17 +232,51 @@ function renderCustomerCategoryTabs(categories = customerCustomCategories) {
 }
 
 function sheetDataUrl() {
-  return String(window.ANDTETE_CONFIG?.sheetWebAppUrl || localStorage.getItem(sheetUrlStorageKey) || "").trim();
+  return String(window.ANDTETE_CONFIG?.sheetWebAppUrl || readLocalSetting(sheetUrlStorageKey) || "").trim();
 }
 
-function loadRemoteProducts(url) {
+function normalizeRemoteProductPayload(payload) {
+  const products = Array.isArray(payload) ? payload : payload?.products;
+  const categories = Array.isArray(payload?.categories) ? payload.categories : [];
+  if (!Array.isArray(products)) throw new Error("商品データの形式が正しくありません。");
+  return { products, categories };
+}
+
+function readCachedProductData() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(productDataCacheKey) || "{}");
+    if (!Array.isArray(cached.products)) return null;
+    return {
+      products: cached.products,
+      categories: Array.isArray(cached.categories) ? cached.categories : [],
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function writeCachedProductData(data) {
+  if (!Array.isArray(data?.products) || !data.products.length) return;
+  try {
+    localStorage.setItem(productDataCacheKey, JSON.stringify({
+      products: data.products,
+      categories: Array.isArray(data.categories) ? data.categories : [],
+      savedAt: Date.now(),
+    }));
+  } catch (error) {}
+}
+
+function loadRemoteProductsOnce(url, timeoutMs = 18000) {
   return new Promise((resolve, reject) => {
     const callbackName = `andteteProductsCallback_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const script = document.createElement("script");
     const separator = url.includes("?") ? "&" : "?";
-    const timeout = window.setTimeout(() => finish(new Error("商品データの取得がタイムアウトしました。")), 12000);
+    const timeout = window.setTimeout(() => finish(new Error("商品データの取得がタイムアウトしました。")), timeoutMs);
+    let completed = false;
 
     function finish(error, products) {
+      if (completed) return;
+      completed = true;
       window.clearTimeout(timeout);
       script.remove();
       delete window[callbackName];
@@ -234,18 +285,24 @@ function loadRemoteProducts(url) {
     }
 
     window[callbackName] = (payload) => {
-      const products = Array.isArray(payload) ? payload : payload?.products;
-      const categories = Array.isArray(payload?.categories) ? payload.categories : [];
-      if (!Array.isArray(products)) {
-        finish(new Error("商品データの形式が正しくありません。"));
-        return;
+      try {
+        finish(null, normalizeRemoteProductPayload(payload));
+      } catch (error) {
+        finish(error);
       }
-      finish(null, { products, categories });
     };
 
     script.onerror = () => finish(new Error("商品データを取得できませんでした。"));
+    script.async = true;
     script.src = `${url}${separator}callback=${encodeURIComponent(callbackName)}&_=${Date.now()}`;
     document.head.appendChild(script);
+  });
+}
+
+function loadRemoteProducts(url, retries = 1) {
+  return loadRemoteProductsOnce(url).catch((error) => {
+    if (retries <= 0) throw error;
+    return new Promise((resolve) => window.setTimeout(resolve, 700)).then(() => loadRemoteProducts(url, retries - 1));
   });
 }
 
@@ -313,7 +370,7 @@ document.addEventListener("click", (event) => {
   const gridSize = event.target.closest("[data-grid-size-button]");
   if (gridSize) {
     activeGridSize = gridSize.dataset.gridSizeButton;
-    localStorage.setItem("andteteListGridSize", activeGridSize);
+    writeLocalSetting("andteteListGridSize", activeGridSize);
     renderListProducts(activeListCategory);
     return;
   }
@@ -405,6 +462,8 @@ document.addEventListener("error", (event) => {
 }, true);
 
 function setupSliders() {
+  if (slidersInitialized) return;
+  slidersInitialized = true;
   const sliders = new Map(
     [...document.querySelectorAll("[data-slider]")].map((slider) => [slider.dataset.slider, slider])
   );
@@ -462,16 +521,27 @@ function setupSliders() {
 async function loadProducts() {
   if (!document.querySelector("[data-products]")) return;
 
-  renderProductLoadingState();
+  const cachedData = readCachedProductData();
+  const hasCachedProducts = Boolean(cachedData?.products?.length);
+  if (hasCachedProducts) {
+    renderProducts(cachedData.products, cachedData.categories);
+    setupSliders();
+  } else {
+    renderProductLoadingState();
+  }
+
   const remoteUrl = sheetDataUrl();
   if (remoteUrl.startsWith("https://script.google.com/")) {
     try {
-      const remoteData = await loadRemoteProducts(remoteUrl);
+      const remoteData = await loadRemoteProducts(remoteUrl, 2);
+      writeCachedProductData(remoteData);
       renderProducts(remoteData.products, remoteData.categories);
       setupSliders();
       return;
     } catch (error) {
-      renderProductLoadingState("商品データを読み込めませんでした。少し時間を置いて再読み込みしてください。");
+      if (!hasCachedProducts) {
+        renderProductLoadingState("商品データを読み込めませんでした。少し時間を置いて再読み込みしてください。");
+      }
       setupSliders();
       console.warn("スプレッドシートの商品取得に失敗しました。", error);
       return;
@@ -504,11 +574,18 @@ const refreshInterval = Math.max(15000, Number(window.ANDTETE_CONFIG?.refreshInt
 window.setInterval(async () => {
   const remoteUrl = sheetDataUrl();
   if (!remoteUrl.startsWith("https://script.google.com/")) return;
+  if (remoteProductsRequest) return;
   try {
-    const data = await loadRemoteProducts(remoteUrl);
-    if (data.products.length) renderProducts(data.products, data.categories);
+    remoteProductsRequest = loadRemoteProducts(remoteUrl, 1);
+    const data = await remoteProductsRequest;
+    if (data.products.length) {
+      writeCachedProductData(data);
+      renderProducts(data.products, data.categories);
+    }
   } catch (error) {
     console.warn("商品の自動更新を次回再試行します。", error);
+  } finally {
+    remoteProductsRequest = null;
   }
 }, refreshInterval);
 
