@@ -1,19 +1,31 @@
 const defaultProductImage = "./assets/hero-handmade.png";
 const productSheetUrlKey = "andteteSheetWebhookUrl";
 const cartStorageKey = "andteteCart";
+const productDataCacheKey = "andteteRemoteProductCache";
 
-function productSheetUrl() {
-  return String(window.ANDTETE_CONFIG?.sheetWebAppUrl || localStorage.getItem(productSheetUrlKey) || "").trim();
+function readProductStoredText(key) {
+  try {
+    return localStorage.getItem(key) || "";
+  } catch (error) {
+    return "";
+  }
 }
 
-function loadRemoteProductList(url) {
+function productSheetUrl() {
+  return String(window.ANDTETE_CONFIG?.sheetWebAppUrl || readProductStoredText(productSheetUrlKey) || "").trim();
+}
+
+function loadRemoteProductListOnce(url, timeoutMs = 18000) {
   return new Promise((resolve, reject) => {
     const callbackName = `andteteProductPageCallback_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const script = document.createElement("script");
     const separator = url.includes("?") ? "&" : "?";
-    const timeout = window.setTimeout(() => finish(new Error("商品データの取得がタイムアウトしました。")), 12000);
+    const timeout = window.setTimeout(() => finish(new Error("商品データの取得がタイムアウトしました。")), timeoutMs);
+    let completed = false;
 
     function finish(error, products) {
+      if (completed) return;
+      completed = true;
       window.clearTimeout(timeout);
       script.remove();
       delete window[callbackName];
@@ -30,9 +42,26 @@ function loadRemoteProductList(url) {
       finish(null, products);
     };
     script.onerror = () => finish(new Error("商品データを取得できませんでした。"));
+    script.async = true;
     script.src = `${url}${separator}callback=${encodeURIComponent(callbackName)}&_=${Date.now()}`;
     document.head.appendChild(script);
   });
+}
+
+function loadRemoteProductList(url, retries = 1) {
+  return loadRemoteProductListOnce(url).catch((error) => {
+    if (retries <= 0) throw error;
+    return new Promise((resolve) => window.setTimeout(resolve, 700)).then(() => loadRemoteProductList(url, retries - 1));
+  });
+}
+
+function readCachedProductList() {
+  try {
+    const cached = JSON.parse(readProductStoredText(productDataCacheKey) || "{}");
+    return Array.isArray(cached.products) ? cached.products : [];
+  } catch (error) {
+    return [];
+  }
 }
 
 function escapeProductHtml(value) {
@@ -357,13 +386,14 @@ function setupProductMenuToggle() {
 
 async function loadPurchaseProduct() {
   const id = new URLSearchParams(window.location.search).get("id");
-  let products = [];
+  let products = readCachedProductList();
   const remoteUrl = productSheetUrl();
-  const previewProducts = localStorage.getItem("andteteProductsPreview");
+  const previewProducts = readProductStoredText("andteteProductsPreview");
 
   if (remoteUrl.startsWith("https://script.google.com/")) {
     try {
-      products = await loadRemoteProductList(remoteUrl);
+      const remoteProducts = await loadRemoteProductList(remoteUrl, 2);
+      if (remoteProducts.length) products = remoteProducts;
     } catch (error) {
       console.warn("スプレッドシートの商品取得に失敗しました。", error);
     }
